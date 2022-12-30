@@ -40,7 +40,8 @@ enum connection_state
     STATE_DATA_RECEIVED,
     STATE_DATA_SENT,
     STATE_CONNECTION_CLOSED,
-    STATE_FRAGMENT_SENT
+    STATE_FRAGMENT_SENT,
+    STATE_FRAGMENT_RECIEVED
 };
 
 /* structure acting as a connection handler */
@@ -80,7 +81,9 @@ struct connection
 static int on_path_cb(http_parser *p, const char *buf, size_t len)
 {
     assert(p == &request_parser);
-    memcpy(request_path, buf, len);
+    char path[BUFSIZ];
+    sscanf(buf, "%[^.]", path);
+    sprintf(request_path, "%s%s.dat", AWS_DOCUMENT_ROOT, path + 1);
 
     return 0;
 }
@@ -99,7 +102,8 @@ static http_parser_settings settings_on_path = {
     /* on_message_complete */ 0};
 
 /*
- * Initialize connection structure on given socket.
+ * Receive (HTTP) request. Don't parse it, just read data in buffer
+ * and print it.
  */
 
 static struct connection *connection_create(int sockfd)
@@ -125,6 +129,8 @@ static struct connection *connection_create(int sockfd)
     conn->counter_got = 0;
     conn->counter_send = 0;
     conn->counter_submits = 0;
+    conn->last = 0;
+    conn->total = 0;
 
     return conn;
 }
@@ -133,11 +139,11 @@ static struct connection *connection_create(int sockfd)
  * Copy receive buffer to send buffer (echo).
  */
 
-static void connection_copy_buffers(struct connection *conn)
-{
-    conn->send_len = conn->recv_len;
-    memcpy(conn->send_buffer, conn->recv_buffer, conn->send_len);
-}
+// static void connection_copy_buffers(struct connection *conn)
+// {
+//     conn->send_len = conn->recv_len;
+//     memcpy(conn->send_buffer, conn->recv_buffer, conn->send_len);
+// }
 
 /*
  * Remove connection handler.
@@ -197,12 +203,18 @@ static enum connection_state send_message(struct connection *conn)
         goto remove_connection;
     }
 
-    bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
+    bytes_sent = send(conn->sockfd, conn->send_buffer + conn->message_size,
+                      conn->send_len - conn->message_size, 0);
     if (bytes_sent < 0)
     { /* error in communication */
         dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
         goto remove_connection;
     }
+
+    conn->message_size = conn->message_size + bytes_sent;
+    if (conn->message_size < conn->send_len)
+        return STATE_FRAGMENT_SENT;
+
     if (bytes_sent == 0)
     { /* connection closed */
         dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
@@ -211,11 +223,11 @@ static enum connection_state send_message(struct connection *conn)
 
     dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
 
-    printf("--\n%s--\n", conn->send_buffer);
+    // printf("--\n%s--\n", conn->send_buffer);
 
     /* all done - remove out notification */
-    rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
-    DIE(rc < 0, "w_epoll_update_ptr_in");
+    // rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
+    // DIE(rc < 0, "w_epoll_update_ptr_in");
 
     conn->state = STATE_DATA_SENT;
 
@@ -265,8 +277,19 @@ static enum connection_state receive_message(struct connection *conn)
 
     printf("--\n%s--\n", conn->recv_buffer);
 
-    conn->recv_len = bytes_recv;
+    conn->recv_len += bytes_recv;
     conn->state = STATE_DATA_RECEIVED;
+
+    conn->recv_buffer[conn->recv_len] = 0;
+    if (strcmp(conn->recv_buffer + conn->recv_len - 4, "\r\n\r\n") != 0)
+        return STATE_FRAGMENT_RECIEVED;
+
+    http_parser_init(&request_parser, HTTP_REQUEST);
+
+    int bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer,
+                                           conn->recv_len);
+    if (bytes_parsed == 0)
+        goto remove_connection;
 
     return STATE_DATA_RECEIVED;
 
@@ -274,22 +297,35 @@ remove_connection:
     rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
     DIE(rc < 0, "w_epoll_remove_ptr");
 
+    close(conn->sockfd);
+
+    rc = io_destroy(conn->context);
+    DIE(rc < 0, "io_destroy");
+
     /* remove current connection */
     connection_remove(conn);
 
     return STATE_CONNECTION_CLOSED;
 }
 
+/*
+ * Send HTTP reply. Send simple message, don't care about request content.
+ *
+ * Socket is closed after HTTP reply.
+ */
+
 static void put_header(struct connection *conn)
 {
     char buffer[BUFSIZ];
 
     sprintf(buffer, "HTTP/1.1 200 OK\r\n"
-                    "Date: Fri, 31 Dec 2022 07:29:07 GMT\r\n"
-                    "Content-Type: text/html\r\n"
-                    "Content-Length: %d\r\n"
+                    "Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
+                    "Server: Apache/2.2.9\r\n"
+                    "Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
                     "Accept-Ranges: bytes\r\n"
+                    "Content-Length: %d\r\n"
                     "Vary: Accept-Encoding\r\n"
+                    "Connection: close\r\n"
                     "Content-Type: text/html\r\n"
                     "\r\n",
             conn->size);
@@ -300,11 +336,13 @@ static void put_header(struct connection *conn)
 static void put_error(struct connection *conn)
 {
     char buffer[BUFSIZ] = "HTTP/1.1 404 Not Found\r\n"
-                          "Date: Sun, 31 Dec 2022 07:29:07 GMT\r\n"
-                          "Content-Type: text/html\r\n"
-                          "Content-Length: %d\r\n"
+                          "Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
+                          "Server: Apache/2.2.9\r\n"
+                          "Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
                           "Accept-Ranges: bytes\r\n"
+                          "Content-Length: 153\r\n"
                           "Vary: Accept-Encoding\r\n"
+                          "Connection: close\r\n"
                           "Content-Type: text/html\r\n"
                           "\r\n";
     conn->send_len = strlen(buffer);
@@ -317,20 +355,19 @@ static void handle_client_request(struct connection *connection)
     enum connection_state ret_state;
 
     ret_state = receive_message(connection);
-    if (ret_state == STATE_CONNECTION_CLOSED)
+    if (ret_state == STATE_CONNECTION_CLOSED || ret_state == STATE_FRAGMENT_RECIEVED)
         return;
 
-    connection_copy_buffers(connection);
-
-    /* add socket to epoll for out events */
-    rc = w_epoll_update_ptr_inout(epollfd, connection->sockfd, connection);
-    DIE(rc < 0, "w_epoll_add_ptr_inout");
-
+    // connection_copy_buffers(connection);
     char _static[BUFSIZ];
     sprintf(_static, "%sstatic/", AWS_DOCUMENT_ROOT);
 
     char dynamic[BUFSIZ];
     sprintf(dynamic, "%sdynamic/", AWS_DOCUMENT_ROOT);
+
+    /* add socket to epoll for out events */
+    rc = w_epoll_update_ptr_out(epollfd, connection->sockfd, connection);
+    DIE(rc < 0, "w_epoll_add_ptr_out");
 
     // open input
     connection->fd = open(request_path, O_RDONLY);
@@ -351,16 +388,16 @@ static void handle_client_request(struct connection *connection)
     if (!strncmp(request_path, dynamic, strlen(dynamic)))
     {
         connection->id = 3;
-        connection->status = 1;
         put_header(connection);
+        connection->status = 1;
         return;
     }
 
     if (!strncmp(request_path, _static, strlen(_static)))
     {
         connection->id = 2;
-        connection->status = 1;
         put_header(connection);
+        connection->status = 1;
         return;
     }
 
@@ -371,7 +408,7 @@ static void handle_client_request(struct connection *connection)
 static void handle_event(struct connection *connection)
 {
     struct io_event events[connection->counter_submits];
-    unsigned int val;
+    u_int64_t val;
 
     int rc = read(connection->efd, &val, sizeof(val));
     DIE(rc < 0, "read efd");
@@ -385,19 +422,19 @@ static void handle_event(struct connection *connection)
     DIE(rc < 0, "w_epoll_add_ptr_out");
 }
 
-static void invalid_event(struct connection *connection)
+static void destroy_connection(struct connection *connection)
 {
     // remove pointer
-    int rc = w_epoll_remove_ptr(epollfd, connection->sockfd, connection);
-    DIE(rc < 0, "w_epoll_remove_ptr");
+    int ret_code = w_epoll_remove_ptr(epollfd, connection->sockfd, connection);
+    DIE(ret_code < 0, "w_epoll_remove_ptr");
 
     // destroy connection
-    rc = io_destroy(connection->context);
-    DIE(rc < 0, "io_destroy");
+    ret_code = io_destroy(connection->context);
+    DIE(ret_code < 0, "io_destroy");
 
     // close file descriptors and connection
-    close(connection->sockfd);
     close(connection->fd);
+    close(connection->sockfd);
     connection_remove(connection);
 }
 
@@ -405,7 +442,7 @@ static void send_message_event(struct connection *connection)
 {
     int real_size = connection->size - connection->offset;
 
-    if (real_size >= BUFSIZ)
+    if (real_size > BUFSIZ)
         real_size = BUFSIZ;
 
     // send BUFSIZ bytes every time
@@ -419,52 +456,41 @@ static void send_message_event(struct connection *connection)
         connection->status = 0;
         connection->message_size = 0;
 
-        // remove pointer
-        int ret_code = w_epoll_remove_ptr(epollfd, connection->sockfd, connection);
-        DIE(ret_code < 0, "w_epoll_remove_ptr");
-
-        // destroy connection
-        ret_code = io_destroy(connection->context);
-        DIE(ret_code < 0, "io_destroy");
-
-        // close file descriptors and connection
-        close(connection->fd);
-        close(connection->sockfd);
-        connection_remove(connection);
+        destroy_connection(connection);
     }
 }
 
-static void alloc_resources(struct connection *connection)
+static void alloc_resources(struct connection *connection, int max)
 {
-    connection->iocb = malloc((connection->size / BUFSIZ + 1) * sizeof(struct iocb));
+    connection->iocb = malloc(max * sizeof(struct iocb));
     DIE(connection->iocb == NULL, "alloc_iocb");
 
-    connection->arr_iocb = malloc((connection->size / BUFSIZ + 1) * sizeof(struct iocb *));
+    connection->arr_iocb = malloc(max * sizeof(struct iocb *));
     DIE(connection->iocb == NULL, "alloc_arr_iocb");
 
-    connection->buffer_matrix = malloc((connection->size / BUFSIZ + 1) * sizeof(char *));
+    connection->buffer_matrix = malloc(max * sizeof(char *));
     DIE(connection->iocb == NULL, "alloc_buffer_matrix");
 
-    for (int i = 0; i < (connection->size / BUFSIZ + 1); i++)
+    for (int i = 0; i < max; i++)
     {
         connection->buffer_matrix[i] = malloc(BUFSIZ * sizeof(char));
-        DIE(connection->buffer_matrix[i], "alloc_buffer_matrix");
+        DIE(connection->buffer_matrix[i], "alloc_buffer_matrix[]");
     }
 }
 
 static void send_aio_message(struct connection *connection)
 {
-    alloc_resources(connection);
     int max;
     if (!connection->size % BUFSIZ)
         max = connection->size / BUFSIZ;
     else
         max = connection->size / BUFSIZ + 1;
+    alloc_resources(connection, max);
 
     for (int i = 0; i < max; i++)
     {
         int real_size = connection->size - connection->offset;
-        if (real_size >= BUFSIZ)
+        if (real_size > BUFSIZ)
             real_size = BUFSIZ;
 
         connection->arr_iocb[i] = &connection->iocb[i];
@@ -472,8 +498,10 @@ static void send_aio_message(struct connection *connection)
                       real_size, connection->offset);
         io_set_eventfd(&connection->iocb[i], connection->efd);
 
-        connection->offset = real_size;
-        connection->last = real_size;
+        connection->offset = connection->offset + real_size;
+
+        if (i == max - 1)
+            connection->last = real_size;
     }
 
     // remove pointer
@@ -484,20 +512,43 @@ static void send_aio_message(struct connection *connection)
     ret_code = io_submit(connection->context, max - connection->counter_submits,
                          connection->arr_iocb + connection->counter_submits);
     DIE(ret_code < 0, "io_submit");
-    connection->counter_submits -= ret_code;
+    connection->counter_submits += ret_code;
 
     w_epoll_add_ptr_inout(epollfd, connection->efd, connection);
 
     connection->total = max;
-    connection->id = 3;
+    connection->status = 3;
 }
 
 static int check_ret_code(struct connection *connection)
 {
-    num connection_state ret_code = send_message(connection);
+    enum connection_state ret_code = send_message(connection);
     if (ret_code == STATE_CONNECTION_CLOSED || ret_code == STATE_FRAGMENT_SENT)
         return 0;
     return 1;
+}
+
+static void equal_counters(struct connection *connection)
+{
+    int ret_code = w_epoll_remove_ptr(epollfd, connection->sockfd, connection);
+    DIE(ret_code < 0, "w_epoll_remove_ptr");
+
+    if (connection->total > connection->counter_submits)
+    {
+        ret_code = io_submit(connection->context, connection->total - connection->counter_submits,
+                             connection->arr_iocb + connection->counter_submits);
+        DIE(ret_code < 0, "io_submit");
+        connection->counter_submits = connection->counter_submits + ret_code;
+    }
+}
+
+static void free_resources(struct connection *connection)
+{
+    for (int i = 0; i < connection->counter_submits; i++)
+        free(connection->buffer_matrix[i]);
+    free(connection->buffer_matrix);
+
+    destroy_connection(connection);
 }
 
 int main(void)
@@ -541,87 +592,73 @@ int main(void)
             if (rev.events & EPOLLIN)
                 handle_new_connection();
         }
-        else
+        else if (rev.events & EPOLLIN)
         {
-            if (rev.events & EPOLLIN)
+            if (connection->id == 1 || connection->id == 2)
             {
-                if (connection->id == 1 || connection->id == 2)
-                {
-                    // basic handle for cases 1 and 2
-                    dlog(LOG_DEBUG, "New message\n");
-                    handle_client_request(rev.data.ptr);
-                    continue;
-                }
-
-                if (connection->id == 3 && connection->status == 3)
-                {
-                    handle_event(connection);
-                    continue;
-                }
+                // basic handle for cases 1 and 2
+                dlog(LOG_DEBUG, "New message\n");
+                handle_client_request(rev.data.ptr);
+                continue;
             }
-
-            if (rev.events & EPOLLOUT)
+            else if (connection->id == 3 && connection->status == 3)
+                handle_event(connection);
+        }
+        else if (rev.events & EPOLLOUT)
+        {
+            if (connection->id == 1)
             {
-                if (connection->id == 1)
+                if (!check_ret_code(connection))
+                    continue;
+                destroy_connection(connection);
+            }
+            else if (connection->id == 2)
+            {
+                if (connection->status == 1)
                 {
                     if (!check_ret_code(connection))
                         continue;
-                    invalid_event(connection);
+                    connection->id = 2;
+                    connection->message_size = 0;
+                }
+                else if (connection->status == 2)
+                {
+                    send_message_event(connection);
                     continue;
                 }
-
-                if (connection->id == 2)
+            }
+            else if (connection->id == 3)
+            {
+                if (connection->status == 1)
                 {
-                    if (connection->status == 1)
-                    {
-                        if (!check_ret_code(connection))
-                            continue;
-                        connection->id = 2;
-                        connection->message_size = 0;
+                    if (!check_ret_code(connection))
                         continue;
-                    }
-
-                    if (connection->status == 2)
-                    {
-                        send_message_event(connection);
-                        continue;
-                    }
+                    connection->id = 2;
+                    connection->message_size = 0;
                 }
-
-                if (connection->id == 3)
+                else if (connection->status == 2)
                 {
-                    if (connection->status == 1)
+                    send_aio_message(connection);
+                }
+                else if (connection->status == 3)
+                {
+
+                    if (connection->counter_send < connection->counter_got)
                     {
+                        memcpy(connection->send_buffer,
+                               connection->buffer_matrix[connection->counter_send], BUFSIZ);
+                        connection->message_size = BUFSIZ;
+                        if (connection->counter_send == connection->counter_submits - 1)
+                            connection->message_size = connection->last;
                         if (!check_ret_code(connection))
                             continue;
-                        connection->id = 2;
+                        connection->counter_send++;
                         connection->message_size = 0;
-                        continue;
                     }
-
-                    if (connection->status == 2)
-                    {
-                        send_aio_message(connection);
-                        continue;
-                    }
-
-                    if (connection->status == 3)
-                    {
-
-                        if (connection->counter_send > connection->counter_got)
-                        {
-                            connection->message_size = BUFSIZ;
-                            if (connection->counter_send == connection->counter_submits - 1)
-                                connection->message_size = connection->last;
-                            if (!check_ret_code(connection))
-                                continue;
-                            connection->counter_send++;
-                            connection->message_size = 0;
-                        }
-                        else if (connection->counter_send == connection->counter_got)
-                        {
-                        }
-                    }
+                    if (connection->counter_send == connection->counter_got)
+                        equal_counters(connection);
+                    if (connection->counter_send == connection->total)
+                        free_resources(connection);
                 }
             }
         }
