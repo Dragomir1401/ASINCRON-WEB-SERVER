@@ -1,39 +1,13 @@
-==8755== Memcheck, a memory error detector
-==8755== Copyright (C) 2002-2017, and GNU GPL'd, by Julian Seward et al.
-==8755== Using Valgrind-3.15.0 and LibVEX; rerun with -h for copyright info
-==8755== Command: ./aws
-==8755== Parent PID: 8753
-==8755== 
-==8755== Syscall param epoll_ctl(event) points to uninitialised byte(s)
-==8755==    at 0x497FACE: epoll_ctl (syscall-template.S:78)
-==8755==    by 0x10A799: w_epoll_add_fd_in (w_epoll.h:29)
-==8755==    by 0x10C442: main (aws.c:567)
-==8755==  Address 0x1ffeffff94 is on thread 1's stack
-==8755==  in frame #1, created by w_epoll_add_fd_in (w_epoll.h:23)
-==8755== 
-==8755== 
-==8755== Process terminating with default action of signal 15 (SIGTERM)
-==8755==    at 0x497F3F8: epoll_wait (epoll_wait.c:30)
-==8755==    by 0x10A9A2: w_epoll_wait_infinite (w_epoll.h:174)
-==8755==    by 0x10C49C: main (aws.c:579)
-==8755== 
-==8755== HEAP SUMMARY:
-==8755==     in use at exit: 16,504 bytes in 1 blocks
-==8755==   total heap usage: 1 allocs, 0 frees, 16,504 bytes allocated
-==8755== 
-==8755== 16,504 bytes in 1 blocks are still reachable in loss record 1 of 1
-==8755==    at 0x483B7F3: malloc (in /usr/lib/x86_64-linux-gnu/valgrind/vgpreload_memcheck-amd64-linux.so)
-==8755==    by 0x10AA9E: connection_create (aws.c:111)
-==8755==    by 0x10AD51: handle_new_connection (aws.c:181)
-==8755==    by 0x10C506: main (aws.c:593)
-==8755== 
-==8755== LEAK SUMMARY:
-==8755==    definitely lost: 0 bytes in 0 blocks
-==8755==    indirectly lost: 0 bytes in 0 blocks
-==8755==      possibly lost: 0 bytes in 0 blocks
-==8755==    still reachable: 16,504 bytes in 1 blocks
-==8755==         suppressed: 0 bytes in 0 blocks
-==8755== 
-==8755== Use --track-origins=yes to see where uninitialised values come from
-==8755== For lists of detected and suppressed errors, rerun with: -s
-==8755== ERROR SUMMARY: 1 errors from 1 contexts (suppressed: 0 from 0)
+==9059== Memcheck, a memory error detector
+==9059== Copyright (C) 2002-2017, and GNU GPL'd, by Julian Seward et al.
+==9059== Using Valgrind-3.15.0 and LibVEX; rerun with -h for copyright info
+==9059== Command: ./aws
+==9059== Parent PID: 9057
+==9059== 
+==9059== Syscall param epoll_ctl(event) points to uninitialised byte(s)
+==9059==    at 0x497FACE: epoll_ctl (syscall-template.S:78)
+==9059==    by 0x10A799: w_epoll_add_fd_in (w_epoll.h:29)
+==9059==    by 0x10C533: main (aws.c:542)
+==9059==  Address 0x1ffeffffc4 is on thread 1's stack
+==9059==  in frame #1, created by w_epoll_add_fd_in (w_epoll.h:23)
+==9059== 
