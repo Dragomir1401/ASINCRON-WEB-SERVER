@@ -418,26 +418,42 @@ static void send_file_aio(struct connection *conn)
 
     conn->nr_total = n;
     conn->stare = 2;
-
-    // free(iocb);
-    // free(piocb);
 }
 
-static void get_events(struct connection *conn)
+static void process_events(struct connection *conn)
 {
     u_int64_t efd_val;
     struct io_event events[conn->nr_sub];
 
-    int rc = read(conn->efd, &efd_val, sizeof(efd_val));
-    DIE(rc < 0, "read efd");
+    // Read the event file descriptor to get the number of completed I/O operations
+    int result = read(conn->efd, &efd_val, sizeof(efd_val));
+    if (result == -1)
+    {
+        perror("read efd");
+        return;
+    }
 
-    rc = io_getevents(conn->ctx, efd_val, efd_val, events, NULL);
-    DIE(rc != efd_val, "io_getevents");
+    // Get the completed I/O events
+    result = io_getevents(conn->ctx, efd_val, efd_val, events, NULL);
+    if (result != efd_val)
+    {
+        perror("io_getevents");
+        return;
+    }
 
+    // Update the number of completed I/O operations
     conn->nr_got += efd_val;
 
-    rc = w_epoll_add_ptr_out(epollfd, conn->sockfd, conn);
-    DIE(rc < 0, "w_epoll_add_ptr_out");
+    // Add the connection's socket to the epoll event loop for writing
+    result = epoll_ctl(epollfd, EPOLL_CTL_ADD, conn->sockfd, &(struct epoll_event){
+                                                                 .events = EPOLLOUT,
+                                                                 .data = {.ptr = conn},
+                                                             });
+    if (result == -1)
+    {
+        perror("epoll_ctl");
+        return;
+    }
 }
 
 static int check_ret_code(struct connection *connection)
@@ -448,84 +464,121 @@ static int check_ret_code(struct connection *connection)
     return 1;
 }
 
-static void destroy_connection_efd(struct connection *connection)
+static void destroy_connection(struct connection *conn, int type)
 {
-    // remove pointer
-    int ret_code = w_epoll_remove_ptr(epollfd, connection->efd, connection);
-    DIE(ret_code < 0, "w_epoll_remove_ptr");
+    // Remove the connection from the epoll event loop
+    if (type == 0)
+    {
+        int result = epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->sockfd, NULL);
+        if (result == -1)
+        {
+            perror("epoll_ctl");
+            return;
+        }
+    }
+    else if (type == 1)
+    {
+        int result = epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->efd, NULL);
+        if (result == -1)
+        {
+            perror("epoll_ctl");
+            return;
+        }
+    }
 
-    // destroy connection
-    ret_code = io_destroy(connection->ctx);
-    DIE(ret_code < 0, "io_destroy");
+    // Destroy the connection's I/O context
+    int ret_code = io_destroy(conn->ctx);
+    if (ret_code == -1)
+    {
+        perror("io_destroy");
+        return;
+    }
 
-    // close file descriptors and connection
-    close(connection->sockfd);
-    close(connection->fd);
-    connection_remove(connection);
+    // Close the connection's socket and file descriptor
+    close(conn->sockfd);
+    close(conn->fd);
+
+    // Remove the connection from the list of connections
+    connection_remove(conn);
 }
 
-static void destroy_connection_sockfd(struct connection *connection)
+static void free_resources(struct connection **conn)
 {
-    // remove pointer
-    int ret_code = w_epoll_remove_ptr(epollfd, connection->sockfd, connection);
-    DIE(ret_code < 0, "w_epoll_remove_ptr");
+    for (int i = 0; i < (*conn)->nr_sub; i++)
+    {
+        // Free the memory for each send buffer
+        free((*conn)->send_buffers[i]);
+    }
 
-    // destroy connection
-    ret_code = io_destroy(connection->ctx);
-    DIE(ret_code < 0, "io_destroy");
-
-    // close file descriptors and connection
-    close(connection->sockfd);
-    close(connection->fd);
-    connection_remove(connection);
+    // Free the memory for the array of send buffers
+    free((*conn)->send_buffers);
 }
 
-static void free_resources(struct connection **connection)
+static void send_data(struct connection *conn)
 {
-    for (int i = 0; i < (*connection)->nr_sub; i++)
-        free((*connection)->send_buffers[i]);
-    free((*connection)->send_buffers);
-}
-
-static void send_custom(struct connection *connection)
-{
+    // Determine the number of bytes to send
     int nr_bytes;
-    if (connection->size - connection->offset <= BUFSIZ)
-        nr_bytes = connection->size - connection->offset;
-    else
+
+    nr_bytes = conn->size - conn->offset;
+    if (nr_bytes > BUFSIZ)
         nr_bytes = BUFSIZ;
 
-    int nr = sendfile(connection->sockfd, connection->fd, &connection->offset, nr_bytes);
-    connection->bytes_sent += nr;
-    DIE(nr < 0, "sendfile");
-
-    if (!nr)
+    // Send the data
+    int result = sendfile(conn->sockfd, conn->fd, &conn->offset, nr_bytes);
+    if (result == -1)
     {
-        connection->stare = 0;
-        connection->bytes_sent = 0;
-        destroy_connection_sockfd(connection);
+        perror("sendfile");
+        return;
+    }
+
+    // Update the number of bytes sent
+    conn->bytes_sent += result;
+
+    // Check if the send was successful or not
+    if (result == 0)
+    {
+        // The connection was closed by the other end
+        conn->state = STATE_DATA_RECEIVED;
+        conn->bytes_sent = 0;
+        destroy_connection(conn, 0);
+    }
+    else if (conn->bytes_sent == conn->size)
+    {
+        // The entire file was sent successfully
+        conn->state = STATE_DATA_RECEIVED;
+        conn->bytes_sent = 0;
     }
 }
 
-static void copy_buffers(struct connection *connection)
+static void copy_buffers(struct connection *conn)
 {
-    memcpy(connection->send_buffer, connection->send_buffers[connection->nr_trimise], BUFSIZ);
-    if (connection->nr_trimise == connection->nr_sub - 1)
-        connection->send_len = connection->last_bytes;
-    else
-        connection->send_len = BUFSIZ;
+    // Copy the send buffer for the current I/O operation
+    memmove(conn->send_buffer, conn->send_buffers[conn->nr_trimise], BUFSIZ);
+
+    // Determine the number of bytes to send
+    conn->send_len = (conn->nr_trimise == conn->nr_sub - 1) ? conn->last_bytes : BUFSIZ;
 }
 
-static void custom_submit(struct connection *connection)
+static void custom_submit(struct connection *conn)
 {
-    int rc = w_epoll_remove_ptr(epollfd, connection->sockfd, connection);
-    DIE(rc < 0, "w_epoll_remove_ptr");
-    if (connection->nr_sub < connection->nr_total)
+    // Remove the connection from the epoll event loop
+    int result = epoll_ctl(epollfd, EPOLL_CTL_DEL, conn->sockfd, NULL);
+    if (result == -1)
     {
-        int rc = io_submit(connection->ctx, connection->nr_total - connection->nr_sub, connection->piocb + connection->nr_sub);
-        DIE(rc < 0, "io_submit");
-        connection->nr_sub += rc;
+        perror("epoll_ctl");
+        return;
     }
+
+    // Submit any remaining I/O operations for the connection
+    int num_submitted = io_submit(conn->ctx, conn->nr_total - conn->nr_sub, conn->piocb + conn->nr_sub);
+    if (num_submitted == -1)
+    {
+        perror("io_submit");
+        return;
+    }
+
+    // Update the number of submitted I/O operations
+    conn->nr_sub += num_submitted;
 }
 
 static void epollin_switch(struct connection *connection)
@@ -540,7 +593,7 @@ static void epollin_switch(struct connection *connection)
         break;
     case 2:
         if (connection->stare == connection->caz)
-            get_events(connection);
+            process_events(connection);
         break;
 
     default:
@@ -575,7 +628,7 @@ static int decide_inout(struct connection *connection)
     {
         // total number of buffers were sent, clean up resources and close the connection
         free_resources(&connection);
-        destroy_connection_efd(connection);
+        destroy_connection(connection, 1);
     }
 
     return 1;
@@ -593,7 +646,7 @@ static int send_switch(struct connection *connection, int type)
         break;
     case 1:
         if (type == 0)
-            send_custom(connection);
+            send_data(connection);
         else if (type == 1)
             send_file_aio(connection);
         break;
@@ -615,7 +668,8 @@ static int epollout_switch(struct connection *connection)
     case 0:
         if (!check_ret_code(connection))
             return 0;
-        destroy_connection_sockfd(connection);
+        destroy_connection(connection, 0);
+
         break;
     case 1:
         if (!send_switch(connection, 0))
