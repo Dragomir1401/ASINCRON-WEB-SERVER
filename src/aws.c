@@ -494,10 +494,12 @@ static void send_custom(struct connection *connection)
         nr_bytes = connection->size - connection->offset;
     else
         nr_bytes = BUFSIZ;
+
     int nr = sendfile(connection->sockfd, connection->fd, &connection->offset, nr_bytes);
     connection->bytes_sent += nr;
-    DIE(nr < 0, "eroare trimitere fisier");
-    if (nr == 0)
+    DIE(nr < 0, "sendfile");
+
+    if (!nr)
     {
         connection->stare = 0;
         connection->bytes_sent = 0;
@@ -524,6 +526,110 @@ static void custom_submit(struct connection *connection)
         DIE(rc < 0, "io_submit");
         connection->nr_sub += rc;
     }
+}
+
+static void epollin_switch(struct connection *connection)
+{
+    switch (connection->caz)
+    {
+    case 0:
+        handle_client_request(connection);
+        break;
+    case 1:
+        handle_client_request(connection);
+        break;
+    case 2:
+        if (connection->stare == connection->caz)
+            get_events(connection);
+        break;
+
+    default:
+        break;
+    }
+}
+
+static int decide_inout(struct connection *connection)
+{
+    // still have to manipulate recieved buffers
+    if (connection->nr_got > connection->nr_trimise)
+    {
+        // Copy the remaining buffers
+        copy_buffers(connection);
+
+        // Check the return code
+        if (!check_ret_code(connection))
+            return 0;
+
+        // Increment the number of sent buffers and reset the bytes sent counter
+        connection->nr_trimise++;
+        connection->bytes_sent = 0;
+    }
+
+    if (connection->nr_trimise == connection->nr_got)
+    {
+        // all submitted segments were sent, do one more custom submit
+        custom_submit(connection);
+    }
+
+    if (connection->nr_trimise == connection->nr_total)
+    {
+        // total number of buffers were sent, clean up resources and close the connection
+        free_resources(&connection);
+        destroy_connection_efd(connection);
+    }
+
+    return 1;
+}
+
+static int send_switch(struct connection *connection, int type)
+{
+    switch (connection->stare)
+    {
+    case 0:
+        if (!check_ret_code(connection))
+            return 0;
+        connection->stare = 1;
+        connection->bytes_sent = 0;
+        break;
+    case 1:
+        if (type == 0)
+            send_custom(connection);
+        else if (type == 1)
+            send_file_aio(connection);
+        break;
+    case 2:
+        if (type == 1)
+            if (!decide_inout(connection))
+                return 0;
+        break;
+    default:
+        break;
+    }
+    return 1;
+}
+
+static int epollout_switch(struct connection *connection)
+{
+    switch (connection->caz)
+    {
+    case 0:
+        if (!check_ret_code(connection))
+            return 0;
+        destroy_connection_sockfd(connection);
+        break;
+    case 1:
+        if (!send_switch(connection, 0))
+            return 0;
+        break;
+    case 2:
+        if (!send_switch(connection, 1))
+            return 0;
+        break;
+
+    default:
+        break;
+    }
+    return 1;
 }
 
 int main(void)
@@ -564,67 +670,12 @@ int main(void)
         }
         else if (rev.events & EPOLLIN)
         {
-            if (conn->caz == 0 || conn->caz == 1)
-            {
-                handle_client_request(rev.data.ptr);
-            }
-            else if (conn->caz == 2 && conn->stare == 2)
-            {
-                get_events(conn);
-            }
+            epollin_switch(conn);
         }
         else if (rev.events & EPOLLOUT)
         {
-            if (conn->caz == 0)
-            {
-                if (!check_ret_code(conn))
-                    continue;
-                destroy_connection_sockfd(conn);
-            }
-            else if (conn->caz == 1 && conn->stare == 0)
-            {
-                if (!check_ret_code(conn))
-                    continue;
-                conn->stare = 1;
-                conn->bytes_sent = 0;
-            }
-            else if (conn->caz == 1 && conn->stare == 1)
-            {
-                send_custom(conn);
-            }
-            else if (conn->caz == 2 && conn->stare == 0)
-            {
-                if (!check_ret_code(conn))
-                    continue;
-                conn->stare = 1;
-                conn->bytes_sent = 0;
-            }
-            else if (conn->caz == 2 && conn->stare == 1)
-            {
-                send_file_aio(conn);
-            }
-            else if (conn->caz == 2 && conn->stare == 2)
-            {
-                if (conn->nr_got > conn->nr_trimise)
-                {
-                    copy_buffers(conn);
-                    if (!check_ret_code(conn))
-                        continue;
-                    conn->nr_trimise++;
-                    conn->bytes_sent = 0;
-                }
-
-                if (conn->nr_trimise == conn->nr_got)
-                {
-                    custom_submit(conn);
-                }
-
-                if (conn->nr_trimise == conn->nr_total)
-                {
-                    free_resources(&conn);
-                    destroy_connection_efd(conn);
-                }
-            }
+            if (!epollout_switch(conn))
+                continue;
         }
     }
 
