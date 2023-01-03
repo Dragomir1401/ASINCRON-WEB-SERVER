@@ -24,34 +24,35 @@
 
 #include <errno.h>
 
-#define NR_EVENTS 1
+enum connection_state
+{
+    FULLY_RECEIVED = 0,
+    FRAGMENT_RECEIVED = 1,
+    FULLY_SENT = 2,
+    FRAGMENT_SENT = 3,
+    CLOSED = 4
+};
+
 // Server socket file descriptor
 static int listenfd;
 
 // Epoll file descriptor
 static int epollfd;
 
-enum connection_state
-{
-    FULLY_RECEIVED,
-    FRAGMENT_RECEIVED,
-    FULLY_SENT,
-    FRAGMENT_SENT,
-    CLOSED
-};
-
 struct connection
 {
-    int sockfd;
+
     // buffers used for receiving messages and then echoing them back */
     char recv_buffer[BUFSIZ];
     char send_buffer[BUFSIZ];
+
     size_t recv_len;
     size_t send_len;
 
     struct iocb **request_ptr;
     struct iocb *request;
 
+    int sockfd;
     int fd;
     int efd;
 
@@ -86,7 +87,7 @@ static struct connection *connection_create(int sockfd)
     }
 
     memset(&conn->context, 0, sizeof(io_context_t));
-    int rs = io_setup(NR_EVENTS, &conn->context);
+    int rs = io_setup(1, &conn->context);
     if (rs < 0)
     {
         fprintf(stderr, "Error setting up IO context: %s\n", strerror(errno));
@@ -248,12 +249,25 @@ static int on_path_cb(http_parser *p, const char *buf, size_t len)
 
     return 0;
 }
+static int on_message_begin_cb()
+{
+    return 0;
+}
+int on_header_field_cb(http_parser *p, const char *buf, size_t len)
+{
+    return 0;
+}
+
+int on_header_value_cb(http_parser *p, const char *buf, size_t len)
+{
+    return 0;
+}
 
 // Use mostly null settings except for on_path callback.
-static http_parser_settings settings_on_path = {
-    /* on_message_begin */ 0,
-    /* on_header_field */ 0,
-    /* on_header_value */ 0,
+http_parser_settings settings = {
+    /* on_message_begin */ on_message_begin_cb,
+    /* on_header_field */ on_header_field_cb,
+    /* on_header_value */ on_header_value_cb,
     /* on_path */ on_path_cb,
     /* on_url */ 0,
     /* on_fragment */ 0,
@@ -286,7 +300,7 @@ static enum connection_state receive_request(struct connection *conn)
 
     // Parse the request
     http_parser_init(&request_parser, HTTP_REQUEST);
-    size_t bytes_parsed = http_parser_execute(&request_parser, &settings_on_path,
+    size_t bytes_parsed = http_parser_execute(&request_parser, &settings,
                                               conn->recv_buffer, conn->recv_len);
 
     if (!bytes_parsed)
