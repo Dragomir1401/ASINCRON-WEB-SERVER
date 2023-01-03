@@ -234,29 +234,32 @@ static enum connection_state receive_request(struct connection *conn)
 
     bytes_recv = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ - conn->recv_len, 0);
     if (bytes_recv < 0)
-    { /* error in communication */
+    {
+        /* error in communication */
         goto remove_connection;
     }
     if (bytes_recv == 0)
-    { /* connection closed */
+    {
+        /* connection closed */
         goto remove_connection;
     }
 
     conn->recv_len += bytes_recv;
     conn->state = STATE_DATA_RECEIVED;
 
-    conn->recv_buffer[conn->recv_len] = 0;
-    if (strcmp(conn->recv_buffer + conn->recv_len - 4, "\r\n\r\n") != 0)
+    // Check if the request is complete
+    char *end_of_request = "\r\n\r\n";
+    if (strcmp(conn->recv_buffer + conn->recv_len - strlen(end_of_request), end_of_request) != 0)
         return STATE_DATA_PARTIAL_RECEIVED;
 
+    // Parse the request
     size_t bytes_parsed;
-
-    /* init HTTP_REQUEST parser */
     http_parser_init(&request_parser, HTTP_REQUEST);
-
     bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
     if (bytes_parsed == 0)
+    {
         goto remove_connection;
+    }
     return STATE_DATA_RECEIVED;
 
 remove_connection:
@@ -272,74 +275,43 @@ remove_connection:
     return STATE_CONNECTION_CLOSED;
 }
 
-/*
- * Send HTTP reply. Send simple message, don't care about request content.
- *
- * Socket is closed after HTTP reply.
- */
-
 static void put_header(struct connection *conn)
 {
-    char buffer[BUFSIZ];
-
-    sprintf(buffer, "HTTP/1.1 200 OK\r\n"
-                    "Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
-                    "Server: Apache/2.2.9\r\n"
-                    "Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
-                    "Accept-Ranges: bytes\r\n"
-                    "Content-Length: %ld\r\n"
-                    "Vary: Accept-Encoding\r\n"
-                    "Connection: close\r\n"
-                    "Content-Type: text/html\r\n"
-                    "\r\n",
-            conn->size);
-    conn->send_len = strlen(buffer);
-    memcpy(conn->send_buffer, buffer, strlen(buffer));
+    // Put the header message into the connection's send buffer
+    char header[BUFSIZ];
+    int header_len = snprintf(header, BUFSIZ, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n",
+                              conn->size);
+    if (header_len < 0 || header_len >= BUFSIZ)
+    {
+        fprintf(stderr, "Error creating header message\n");
+        return;
+    }
+    conn->send_len = header_len;
+    strncpy(conn->send_buffer, header, conn->send_len);
 }
 
 static void put_error(struct connection *conn)
 {
-    char buffer[BUFSIZ] = "HTTP/1.1 404 Not Found\r\n"
-                          "Date: Sun, 08 May 2011 09:26:16 GMT\r\n"
-                          "Server: Apache/2.2.9\r\n"
-                          "Last-Modified: Mon, 02 Aug 2010 17:55:28 GMT\r\n"
-                          "Accept-Ranges: bytes\r\n"
-                          "Content-Length: 153\r\n"
-                          "Vary: Accept-Encoding\r\n"
-                          "Connection: close\r\n"
-                          "Content-Type: text/html\r\n"
-                          "\r\n";
-    conn->send_len = strlen(buffer);
-    memcpy(conn->send_buffer, buffer, strlen(buffer));
+    // Put the error message into the connection's send buffer
+    const char *error_msg = "HTTP/1.1 404 Not Found\r\n\r\n";
+    conn->send_len = strlen(error_msg);
+    strncpy(conn->send_buffer, error_msg, conn->send_len);
 }
-
-/*
- * Handle a client request on a client connection.
- */
 
 static void handle_client_request(struct connection *conn)
 {
-    int rc;
-    enum connection_state ret_state;
-
-    // connection_copy_buffers(conn);
-    ret_state = receive_request(conn);
-    // if(conn->stopped) return;
-
-    if (ret_state == STATE_CONNECTION_CLOSED || ret_state == STATE_DATA_PARTIAL_RECEIVED)
+    // Receive the request
+    enum connection_state state = receive_request(conn);
+    if (state == STATE_CONNECTION_CLOSED || state == STATE_DATA_PARTIAL_RECEIVED)
         return;
 
-    char static_prefix[BUFSIZ];
-    char dynamic_prefix[BUFSIZ];
+    // Add the socket to epoll for out events
+    if (w_epoll_update_ptr_out(epollfd, conn->sockfd, conn) < 0)
+    {
+        perror("w_epoll_add_ptr_out");
+        return;
+    }
 
-    sprintf(static_prefix, "%sstatic/", AWS_DOCUMENT_ROOT);
-    sprintf(dynamic_prefix, "%sdynamic/", AWS_DOCUMENT_ROOT);
-
-    /* add socket to epoll for out events */
-    rc = w_epoll_update_ptr_out(epollfd, conn->sockfd, conn); // inout
-    DIE(rc < 0, "w_epoll_add_ptr_out");
-
-    struct stat stat_buf;
     /* Open the input file. */
     conn->fd = open(request_path, O_RDONLY);
     if (conn->fd == -1)
@@ -348,75 +320,144 @@ static void handle_client_request(struct connection *conn)
         put_error(conn);
         return;
     }
+
     /* Stat the input file to obtain its size. */
+    struct stat stat_buf;
     fstat(conn->fd, &stat_buf);
     conn->size = stat_buf.st_size;
     conn->offset = 0;
+
+    // Set the dynamic prefix
+    const char *dynamic_dir = "dynamic/";
+    size_t prefix_len = strlen(AWS_DOCUMENT_ROOT) + strlen(dynamic_dir) + 1;
+    char *dynamic_prefix = malloc(prefix_len);
+    if (dynamic_prefix == NULL)
+    {
+        perror("malloc");
+        return;
+    }
+    snprintf(dynamic_prefix, prefix_len, "%s%s", AWS_DOCUMENT_ROOT, dynamic_dir);
+
+    if (strncmp(request_path, dynamic_prefix, strlen(dynamic_prefix)) == 0)
+    {
+        conn->caz = 2;
+        put_header(conn);
+        conn->stare = 0;
+        return;
+    }
+
+    // Set the static prefix
+    const char *static_dir = "static/";
+    prefix_len = strlen(AWS_DOCUMENT_ROOT) + strlen(static_dir) + 1;
+    char *static_prefix = malloc(prefix_len);
+    if (static_prefix == NULL)
+    {
+        perror("malloc");
+        return;
+    }
+    snprintf(static_prefix, prefix_len, "%s%s", AWS_DOCUMENT_ROOT, static_dir);
 
     if (strncmp(request_path, static_prefix, strlen(static_prefix)) == 0)
     {
         conn->caz = 1;
         conn->stare = 0;
         put_header(conn);
-    }
-    else if (strncmp(request_path, dynamic_prefix, strlen(dynamic_prefix)) == 0)
-    {
-        conn->caz = 2;
-        put_header(conn);
-        conn->stare = 0;
-    }
-    else
-    {
-        put_error(conn);
-        conn->caz = 0;
         return;
     }
+
+    put_error(conn);
+    conn->caz = 0;
 }
 
-static void send_file_aio(struct connection *conn)
+static void prepare_async_read(struct connection *conn)
 {
+    size_t remaining_bytes = conn->size;
+    size_t current_offset = 0;
+    size_t nr_bytes = 0;
+    int i = 0;
 
-    int n = conn->size / BUFSIZ, i;
-    int nr_bytes, rc;
-
-    if (conn->size % BUFSIZ)
-        n++;
-
-    conn->iocb = malloc(n * sizeof(struct iocb));
-    conn->piocb = malloc(n * sizeof(struct iocb *));
-    if (!conn->iocb || !conn->piocb)
+    // Loop until all bytes in the file have been read
+    while (remaining_bytes > 0)
     {
-        perror("iocb alloc");
+        // Allocate memory for the send buffer
+        conn->send_buffers[i] = malloc(BUFSIZ * sizeof(char));
+
+        // Set the number of bytes to read in the current iteration
+        nr_bytes = remaining_bytes;
+        if (nr_bytes > BUFSIZ)
+            nr_bytes = BUFSIZ;
+
+        // Set the piocb for the current iocb
+        conn->piocb[i] = &conn->iocb[i];
+
+        // Prepare the iocb for an async read of the file
+        io_prep_pread(&conn->iocb[i], conn->fd, conn->send_buffers[i], nr_bytes, current_offset);
+
+        // Set the event file descriptor for the iocb
+        io_set_eventfd(&conn->iocb[i], conn->efd);
+
+        // Update the current offset and remaining bytes
+        current_offset += nr_bytes;
+        remaining_bytes -= nr_bytes;
+        i++;
+    }
+
+    // Save the number of bytes read in the last iteration
+    conn->last_bytes = nr_bytes;
+}
+
+void send_file_aio(struct connection *conn)
+{
+    // Calculate the number of buffers needed to send the file
+    int num_buffers = (conn->size + BUFSIZ - 1) / BUFSIZ;
+
+    // Allocate memory for the iocb, piocb, and send_buffers arrays
+    conn->iocb = malloc(num_buffers * sizeof(struct iocb));
+    if (!conn->iocb)
+    {
+        perror("iocb");
         return;
     }
 
-    conn->send_buffers = malloc(n * sizeof(char *));
-
-    for (i = 0; i < n; i++)
+    conn->piocb = malloc(num_buffers * sizeof(struct iocb *));
+    if (!conn->piocb)
     {
-        conn->send_buffers[i] = malloc(BUFSIZ * sizeof(char));
-        conn->piocb[i] = &conn->iocb[i];
-        if (conn->size - conn->offset <= BUFSIZ)
-            nr_bytes = conn->size - conn->offset;
-        else
-            nr_bytes = BUFSIZ;
-        io_prep_pread(&conn->iocb[i], conn->fd, conn->send_buffers[i], nr_bytes, conn->offset);
-        io_set_eventfd(&conn->iocb[i], conn->efd);
-        conn->offset += nr_bytes;
-
-        if (i == n - 1)
-            conn->last_bytes = nr_bytes;
+        perror("piocb");
+        return;
     }
-    rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
-    DIE(rc < 0, "w_epoll_remove_conn");
 
-    rc = io_submit(conn->ctx, n - conn->nr_sub, conn->piocb + conn->nr_sub);
-    DIE(rc < 0, "io_submit");
+    conn->send_buffers = malloc(num_buffers * sizeof(char *));
+    if (!conn->send_buffers)
+    {
+        perror("send_buffers");
+        return;
+    }
+
+    // Set up the async read
+    prepare_async_read(conn);
+
+    // Remove the connection from the epoll file descriptor
+    int rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
+    if (rc < 0)
+    {
+        perror("w_epoll_remove_conn");
+        return;
+    }
+
+    // Submit the iocbs for the async read
+    rc = io_submit(conn->ctx, num_buffers - conn->nr_sub, conn->piocb + conn->nr_sub);
+    if (rc < 0)
+    {
+        perror("io_submit");
+        return;
+    }
     conn->nr_sub += rc;
 
+    // Add the connection to the epoll file descriptor for inout events
     w_epoll_add_ptr_inout(epollfd, conn->efd, conn);
 
-    conn->nr_total = n;
+    // Update the connection's state and number of total buffers
+    conn->nr_total = num_buffers;
     conn->stare = 2;
 }
 
@@ -459,9 +500,9 @@ static void process_events(struct connection *conn)
 static int check_ret_code(struct connection *connection)
 {
     enum connection_state ret_code = send_message(connection);
-    if (ret_code == STATE_CONNECTION_CLOSED || ret_code == STATE_DATA_PARTIAL_SENT)
-        return 0;
-    return 1;
+    if (ret_code != STATE_CONNECTION_CLOSED && ret_code != STATE_DATA_PARTIAL_SENT)
+        return 1;
+    return 0;
 }
 
 static void destroy_connection(struct connection *conn, int type)
