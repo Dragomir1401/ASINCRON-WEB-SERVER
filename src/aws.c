@@ -33,11 +33,11 @@ static int epollfd;
 
 enum connection_state
 {
-    STATE_FULLY_RECEIVED,
-    STATE_FRAGMENT_RECEIVED,
-    STATE_FULLY_SENT,
-    STATE_FRAGMENT_SENT,
-    STATE_CLOSED
+    FULLY_RECEIVED,
+    FRAGMENT_RECEIVED,
+    FULLY_SENT,
+    FRAGMENT_SENT,
+    CLOSED
 };
 
 struct connection
@@ -48,6 +48,9 @@ struct connection
     char send_buffer[BUFSIZ];
     size_t recv_len;
     size_t send_len;
+
+    struct iocb **request_ptr;
+    struct iocb *request;
 
     int fd;
     int efd;
@@ -70,42 +73,47 @@ struct connection
 
     enum connection_state state;
     io_context_t context;
-
-    struct iocb **request_ptr;
-    struct iocb *request;
 };
-
-/*
- * Initialize connection structure on given socket.
- */
 
 static struct connection *connection_create(int sockfd)
 {
     struct connection *conn = malloc(sizeof(*conn));
 
-    DIE(conn == NULL, "malloc");
+    if (conn == NULL)
+    {
+        fprintf(stderr, "Error allocating memory for connection struct: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     memset(&conn->context, 0, sizeof(io_context_t));
     int rs = io_setup(NR_EVENTS, &conn->context);
-    DIE(rs < 0, strerror(errno));
+    if (rs < 0)
+    {
+        fprintf(stderr, "Error setting up IO context: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
-    conn->sockfd = sockfd;
-    conn->step_case = 0;
-    conn->step = 0;
-    conn->submitted_counter = 0;
-    conn->recv_len = 0;
-    conn->send_len = 0;
-    conn->final_counter = 0;
-    conn->offset = 0;
-    conn->total_counter = 0;
-    conn->message_size = 0;
-    conn->send_counter = 0;
-    conn->receive_counter = 0;
-
-    conn->efd = eventfd(0, EFD_NONBLOCK);
-    DIE(conn->efd < 0, "error efd");
+    if ((conn->efd = eventfd(0, EFD_NONBLOCK)) < 0)
+    {
+        perror("error efd");
+        exit(EXIT_FAILURE);
+    }
     memset(conn->recv_buffer, 0, BUFSIZ);
     memset(conn->send_buffer, 0, BUFSIZ);
+    int empty = 0;
+
+    conn->step = empty;
+    conn->offset = empty;
+    conn->sockfd = sockfd;
+    conn->recv_len = empty;
+    conn->send_len = empty;
+    conn->step_case = empty;
+    conn->message_size = empty;
+    conn->send_counter = empty;
+    conn->final_counter = empty;
+    conn->total_counter = empty;
+    conn->receive_counter = empty;
+    conn->submitted_counter = empty;
 
     return conn;
 }
@@ -113,20 +121,21 @@ static struct connection *connection_create(int sockfd)
 static void connection_remove(struct connection *conn)
 {
     close(conn->sockfd);
-    conn->state = STATE_CLOSED;
+    conn->state = CLOSED;
     free(conn);
 }
 
+static char request_path[BUFSIZ]; // storage for request_path
+static http_parser request_parser;
+
 static void handle_new_connection(void)
 {
-    int sockfd;
     socklen_t addrlen = sizeof(struct sockaddr_in);
     struct sockaddr_in addr;
     struct connection *conn;
-    int rc;
 
     // Accept a new connection
-    sockfd = accept(listenfd, (SSA *)&addr, &addrlen);
+    int sockfd = accept(listenfd, (SSA *)&addr, &addrlen);
     if (sockfd < 0)
     {
         perror("accept");
@@ -143,7 +152,7 @@ static void handle_new_connection(void)
     }
 
     flags |= O_NONBLOCK;
-    rc = fcntl(sockfd, F_SETFL, flags);
+    int rc = fcntl(sockfd, F_SETFL, flags);
     if (rc < 0)
     {
         perror("fcntl F_SETFL");
@@ -166,12 +175,10 @@ static void handle_new_connection(void)
 
 static enum connection_state send_message(struct connection *conn)
 {
-    ssize_t message_size;
-    int rc;
-    char abuffer[64];
 
     // Get the peer address of the connection
-    rc = get_peer_address(conn->sockfd, abuffer, 64);
+    char abuffer[64];
+    int rc = get_peer_address(conn->sockfd, abuffer, 64);
     if (rc < 0)
     {
         ERR("get_peer_address");
@@ -179,28 +186,28 @@ static enum connection_state send_message(struct connection *conn)
     }
 
     // Send the data in the send buffer to the client
-    message_size = send(conn->sockfd, conn->send_buffer + conn->message_size,
-                        conn->send_len - conn->message_size, 0);
+    ssize_t message_size = send(conn->sockfd, conn->send_buffer + conn->message_size,
+                                conn->send_len - conn->message_size, 0);
     if (message_size < 0)
         goto remove_connection;
 
     // If not all the data was sent, update the number of bytes sent and return
-    // STATE_FRAGMENT_SENT
+    // FRAGMENT_SENT
     if (conn->message_size + message_size < conn->send_len)
     {
         conn->message_size += message_size;
-        return STATE_FRAGMENT_SENT;
+        return FRAGMENT_SENT;
     }
 
     // If the connection was closed by the client, remove the connection and return
-    // STATE_CLOSED
+    // CLOSED
     if (message_size == 0)
         goto remove_connection;
 
-    // Otherwise, all the data was sent, so update the state and return STATE_FULLY_SENT
-    conn->state = STATE_FULLY_SENT;
+    // Otherwise, all the data was sent, so update the state and return FULLY_SENT
+    conn->state = FULLY_SENT;
 
-    return STATE_FULLY_SENT;
+    return FULLY_SENT;
 
 remove_connection:
     // remove the socket file descriptor from the epoll instance
@@ -221,13 +228,9 @@ remove_connection:
     close(conn->fd);
     connection_remove(conn);
 
-    return STATE_CLOSED;
+    return CLOSED;
 }
 
-static http_parser request_parser;
-static char request_path[BUFSIZ]; // storage for request_path
-
-// Use mostly null settings except for on_path callback. */
 static int on_path_cb(http_parser *p, const char *buf, size_t len)
 {
     // Extract the path from the request and store it in the request_path array
@@ -245,6 +248,8 @@ static int on_path_cb(http_parser *p, const char *buf, size_t len)
 
     return 0;
 }
+
+// Use mostly null settings except for on_path callback.
 static http_parser_settings settings_on_path = {
     /* on_message_begin */ 0,
     /* on_header_field */ 0,
@@ -257,53 +262,37 @@ static http_parser_settings settings_on_path = {
     /* on_headers_complete */ 0,
     /* on_message_complete */ 0};
 
-/*
- * Receive (HTTP) request. Don't parse it, just read data in buffer
- * and print it.
- */
-
 static enum connection_state receive_request(struct connection *conn)
 {
-    ssize_t bytes_recv;
     char abuffer[64];
     int rc;
-
     rc = get_peer_address(conn->sockfd, abuffer, 64);
     if (rc < 0)
-    {
-        ERR("get_peer_address");
         goto remove_connection;
-    }
 
-    bytes_recv = recv(conn->sockfd, conn->recv_buffer + conn->recv_len, BUFSIZ - conn->recv_len, 0);
-    if (bytes_recv < 0)
-    {
-        // Error in communication
+    // Receive data from the socket
+    ssize_t num_bytes = recv(conn->sockfd, conn->recv_buffer + conn->recv_len,
+                             BUFSIZ - conn->recv_len, 0);
+    if (num_bytes <= 0)
         goto remove_connection;
-    }
-    if (bytes_recv == 0)
-    {
-        // Connection closed
-        goto remove_connection;
-    }
 
-    conn->recv_len += bytes_recv;
-    conn->state = STATE_FULLY_RECEIVED;
+    conn->recv_len += num_bytes;
+    conn->state = FULLY_RECEIVED;
 
     // Check if the request is complete
     char *end_of_request = "\r\n\r\n";
-    if (strcmp(conn->recv_buffer + conn->recv_len - strlen(end_of_request), end_of_request) != 0)
-        return STATE_FRAGMENT_RECEIVED;
+    if (strstr(conn->recv_buffer, end_of_request) == NULL)
+        return FRAGMENT_RECEIVED;
 
     // Parse the request
-    size_t bytes_parsed;
     http_parser_init(&request_parser, HTTP_REQUEST);
-    bytes_parsed = http_parser_execute(&request_parser, &settings_on_path, conn->recv_buffer, conn->recv_len);
-    if (bytes_parsed == 0)
-    {
+    size_t bytes_parsed = http_parser_execute(&request_parser, &settings_on_path,
+                                              conn->recv_buffer, conn->recv_len);
+
+    if (!bytes_parsed)
         goto remove_connection;
-    }
-    return STATE_FULLY_RECEIVED;
+
+    return FULLY_RECEIVED;
 
 remove_connection:
     // Close local socket
@@ -325,7 +314,7 @@ remove_connection:
 
     // Remove current connection
     connection_remove(conn);
-    return STATE_CLOSED;
+    return CLOSED;
 }
 
 static void put_header(struct connection *conn)
@@ -355,7 +344,7 @@ static void handle_client_request(struct connection *conn)
 {
     // Receive the request
     enum connection_state state = receive_request(conn);
-    if (state == STATE_CLOSED || state == STATE_FRAGMENT_RECEIVED)
+    if (state == CLOSED || state == FRAGMENT_RECEIVED)
         return;
 
     // Add the socket to epoll for out events
@@ -553,7 +542,7 @@ static void process_events(struct connection *conn)
 static int check_ret_code(struct connection *connection)
 {
     enum connection_state ret_code = send_message(connection);
-    if (ret_code != STATE_CLOSED && ret_code != STATE_FRAGMENT_SENT)
+    if (ret_code != CLOSED && ret_code != FRAGMENT_SENT)
         return 1;
     return 0;
 }
@@ -632,14 +621,14 @@ static void send_data(struct connection *conn)
     if (result == 0)
     {
         // The connection was closed by the other end
-        conn->state = STATE_FULLY_RECEIVED;
+        conn->state = FULLY_RECEIVED;
         conn->message_size = 0;
         destroy_connection(conn, 0);
     }
     else if (conn->message_size == conn->total_size)
     {
         // The entire file was sent successfully
-        conn->state = STATE_FULLY_RECEIVED;
+        conn->state = FULLY_RECEIVED;
         conn->message_size = 0;
     }
 }
@@ -784,32 +773,43 @@ int main(void)
 {
     int rc;
 
-    /* init multiplexing */
+    // Init multiplexing
     epollfd = w_epoll_create();
-    DIE(epollfd < 0, "w_epoll_create");
+    if (epollfd < 0)
+    {
+        fprintf(stderr, "Error creating epoll descriptor: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
-    /* create server socket */
+    // Create server socket
     listenfd = tcp_create_listener(AWS_LISTEN_PORT,
                                    DEFAULT_LISTEN_BACKLOG);
-    DIE(listenfd < 0, "tcp_create_listener");
+    if (listenfd < 0)
+    {
+        fprintf(stderr, "Error creating listen descriptor: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
     rc = w_epoll_add_fd_in(epollfd, listenfd);
-    DIE(rc < 0, "w_epoll_add_fd_in");
+    if (rc < 0)
+    {
+        fprintf(stderr, "Error adding fd in: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
 
-    /* server main loop */
+    // Main loop
     while (1)
     {
         struct epoll_event rev;
 
-        /* wait for events */
+        // Wait for events
         rc = w_epoll_wait_infinite(epollfd, &rev);
-        DIE(rc < 0, "w_epoll_wait_infinite");
+        if (rc < 0)
+        {
+            fprintf(stderr, "Error waiting infinite: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
 
-        /*
-         * switch event types; consider
-         *   - new connection requests (on server socket)
-         *   - socket communication (on connection sockets)
-         */
         struct connection *conn = rev.data.ptr;
         if (rev.data.fd == listenfd)
         {
