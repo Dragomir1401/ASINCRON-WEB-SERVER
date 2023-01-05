@@ -1,0 +1,204 @@
+______________________________
+|                            |
+|   Copyright                |
+|      Dragomir Andrei 2023  |
+|                            |
+|____________________________|
+
+---------------------------------------------------------------------
+Nume: Dragomir Andrei
+Grupa: 322CA
+
+OPERATING SYSTEMS
+
+----------------------------------------------------------------------------
+------------------------ASYNCHRONOUS WEB SERVER-----------------------------
+---------------------------------------------------------------------------- 
+
+								CONTENT
+
+	- aws.c - implementation of the web server with asynchronous operations and
+              other advanced I/O operations.
+	- auxiliary files - headers directory.
+    - utils - http_parser directory, sock_util.c, aws.h, debug.h, sock_util.h, 
+              util directory.
+	- Makefile.
+	- README.
+
+
+----------------------------------------------------------------------------
+
+____________Description___________
+
+
+	The project implements a web server which uses:
+
+             -asynchronous operations on files-
+            
+            -non-blocking operations on sockets-
+            
+                      -zero-copying-
+            
+               -multiplexing I/O operations-
+
+	The web server uses the modern LINUX multiplexing API to wait for
+connections from clients: epoll. On the previously established connections, 
+requests from clients are received and then responses are generated and 
+then distributed to them.
+
+    Clients and server communicate using the HTTP protocol. HTTP parser is
+responsible of parsing clients requests. It is available in the http_parser
+directory and is an extern resource.
+
+    The server implements a limited functionality of the HTTP protocol,
+that of passing files to clients.
+
+    The project is created from the samples provided in util/lin/samples
+where a simple epoll echo server and a reply once http server are available.
+
+-----------------------------------------------------------------------------
+
+
+
+------------------------------------------------------------------------------
+
+____________Implementation____________
+
+
+    The entire assingment was implemented in the program with all the
+requirements.
+
+
+	The implementation consists of a structure which holds all important
+aspects of the server:
+
+        - buffers for receiving/sending through the socket.
+        - I/O control block structure.
+        - file descriptors.
+        - variables which track the state or the step in the program.
+        - counters.
+        - actual status and context of the connection.
+
+
+
+    There are multiple case for the program, each with certain states:
+        
+        - the initial state - the handle_client_request function is
+        called when there is a request from the client - investigation
+        on the request_path is done and we decide what step the connection
+        goes to:
+            - step 2 - dynamic file --> send header.
+            - step 1 - static file --> send header.
+            - step 0 - neither --> error .
+
+            Socket gets POLLOUT flag back in the epoll.
+
+
+        - the first state - chunks of BUFSIZ bytes are sent repeatedly and
+        then we close the connection.
+
+
+        - the second state - we call the send_file_aio function.
+
+        It allocates buffer chunks to be able to store the content of the file.
+        
+        The buffers reads asynchronously: io_prep_pread function, io_set_eventfd
+        until there are no more bytes to read.
+        
+        We set the step_case to second needed for the switch to choose the 
+        decide_inout branch.
+
+
+        decide_inout - the next buffer where read was done is sent and when
+        send_counter matches receive_counter it means that all segments have been
+        sent and one last custom sent is done to finish up.
+
+        The end of the connection is decided when the total number of buffers
+        were sent.
+
+
+    Writing to sockets, for both static and dynamic files, is non-blocking: 
+sockets are marked as non-blocking, and a write call writes as much as the 
+socket buffer allows. On the next notification from the specific API a new 
+write is performed and so on.
+
+    To configure a socket as non-blocking fcntl (O_NONBLOCK flag) was used.
+
+    When a new connection is established the function use looks like:
+    
+    int rc = fcntl(sockfd, F_SETFL, flag);
+
+    with the flag: |= O_NONBLOCK;
+
+    Notifications about the possibility of sending/receiving on
+non-blocking sockets and of the completion of asynchronous operations 
+is done through epoll.
+
+    Static files are sent non-blocking directly from the kernel using 
+zero-copying API: sendfile.
+
+    Dynamic files data is sent asynchronously using functions from the
+io_setup family.
+
+
+------------------------------------------------------------------------------
+
+
+
+
+------------------------------------------------------------------------------
+
+_____________Comments_____________
+
+	
+	The implementation could have been done faster and better if information 
+about web sockets in C would have been better presented in the laboratory. 
+There could be perhaps a shorter close POSIX API version of the functions
+but this way had a better logic for me, using extra error checks behind.
+
+	The project was very useful in helping me learn how to use Linux API 
+for workind with sockets, asynchronous operations on files, non-blocking 
+operations on sockets, zero-copying, multiplexing I/O operations. 
+The most interesting part was to debug the server and to use http protocols.
+The hardest part also was the debug and figuring out how to structure the 
+project in the first place.  
+
+------------------------------------------------------------------------------
+
+
+
+------------------------------------------------------------------------------
+
+
+______________How to run it_____________
+
+
+	make
+- creates the aws executable
+
+First we need a copy of the executable file in the checker or a symbolic link to it
+
+	make -f Makefile.checker or ./run_all.sh from the checker folder
+- use the shared library in tests from checker
+
+
+-----------------------------------------------------------------------------
+
+
+
+
+-----------------------------------------------------------------------------
+
+
+Resources:
+
+https://ocw.cs.pub.ro/courses/so/teme/tema-5
+https://ocw.cs.pub.ro/courses/so/cursuri/curs-10
+https://ocw.cs.pub.ro/courses/so/cursuri/curs-11
+https://ocw.cs.pub.ro/courses/so/laboratoare/laborator-11
+https://github.com/nodejs/http-parser
+https://www.jmarshall.com/easy/http/
+http://elf.cs.pub.ro/so/res/teme/tema5-util/lin/samples/
+
+
+-----------------------------------------------------------------------------
